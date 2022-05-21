@@ -1,0 +1,3 @@
+[submodule "arst/themes/terminal"]
+	path = arst/themes/terminal
+	url = https://github.com/panr/hugo-theme-terminal.git
