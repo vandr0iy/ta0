@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.2
 FROM klakegg/hugo as build
 
-COPY ./arst/ /ta0
+COPY ./ /ta0
 WORKDIR /ta0
 RUN hugo
 

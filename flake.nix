@@ -15,6 +15,7 @@
           buildInputs = with pkgs; [
             docker
             hugo
+            just
           ];
         };
       }
