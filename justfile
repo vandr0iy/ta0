@@ -34,3 +34,7 @@ validate-cfn-template filename="ta0":
 # launches a config scan with trivy
 trivy-scan:
   @trivy config .
+
+# inspect space usage of every docker layer
+dive:
+  @dive ta0-local
