@@ -1,0 +1,320 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Sets up an environment for ta0
+Parameters:
+  ServiceName:
+    Type: String
+    Description: The DNS-compliant name of the service being created
+    AllowedPattern: (?!-)[a-zA-Z0-9-.]{1,63}(?<!-)
+    ConstraintDescription: must be a valid DNS zone name.
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+
+  Subnet0:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        !Ref VPC
+      CidrBlock: 10.0.0.0/24
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: ""
+
+  Subnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone:
+        Fn::Select:
+          - 1
+          - Fn::GetAZs: ""
+
+  Subnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone:
+        Fn::Select:
+          - 2
+          - Fn::GetAZs: ""
+
+  FargateCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref ServiceName
+      ClusterSettings:
+        # otherwise it's gonna be expensive
+        - Name: containerInsights
+          Value: disabled
+      CapacityProviders:
+        - FARGATE
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+
+  ECRRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref ServiceName
+      RepositoryPolicyText:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Sid: AllowPushPull
+            Effect: Allow
+            Principal:
+              AWS:
+                - !Sub "arn:aws:iam::${AWS::AccountId}:user/ci"
+            Action:
+              - "ecr:GetDownloadUrlForLayer"
+              - "ecr:BatchGetImage"
+              - "ecr:BatchCheckLayerAvailability"
+              - "ecr:PutImage"
+              - "ecr:InitiateLayerUpload"
+              - "ecr:UploadLayerPart"
+              - "ecr:CompleteLayerUpload"
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+                {
+                    "rulePriority": 10,
+                    "description": "release docker image gc",
+                    "selection": {
+                        "tagStatus": "any",
+                        "countType": "imageCountMoreThan",
+                        "countNumber": 200
+                    },
+                    "action": {
+                        "type": "expire"
+                    }
+                }
+            ]
+          }
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "ALBs own SG"
+      GroupName: !Sub "${ServiceName}-sg"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          FromPort: 0
+          ToPort: 0
+          CidrIp: 0.0.0.0/0
+
+  ServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Standard SG for all FARGATE services in this VPC"
+      GroupName: !Sub "${ServiceName}-sg"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          FromPort: 0
+          ToPort: 0
+          CidrIp: 0.0.0.0/0
+
+  # NOTE: could be a good idea to configure here the access logs to an S3 bucket
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Subnets:
+        - !Ref Subnet0
+        - !Ref Subnet1
+        - !Ref Subnet2
+
+  ALBDefaultCert:
+    Type: "AWS::CertificateManager::Certificate"
+    Properties:
+      DomainName: example.org
+      ValidationMethod: DNS
+
+  ALBHTTPSListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - !Ref ALBDefaultCert
+      DefaultActions:
+        - Type: "fixed-response"
+          FixedResponseConfig:
+            StatusCode: 404
+            ContentType: "text/plain"
+            MessageBody: "Not Found"
+
+  ALBHTTPListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: "redirect"
+          RedirectConfig:
+            Protocol: "HTTPS"
+            Port: 443
+            Host: "#{host}"
+            Path: "/#{path}"
+            Query: "#{query}"
+            StatusCode: "HTTP_301"
+
+  CIUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: "ci"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser
+
+  CIPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      Users:
+        - !Ref CIUser
+      PolicyName: "ci-policy"
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - cloudformation:Describe*
+              - cloudformation:Get*
+              - cloudformation:List*
+              - cloudformation:CancelUpdateStack
+              - cloudformation:ContinueUpdateRollback
+              - cloudformation:CreateChangeSet
+              - cloudformation:DeleteChangeSet
+              - cloudformation:ExecuteChangeSet
+              - cloudformation:RollbackStack
+              - cloudformation:TagResource
+              - cloudformation:UpdateStack
+              - cloudformation:UpdateStackInstances
+            Resource:
+              - !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/*/*'
+          - Effect: Allow
+            Action:
+              - ecs:DeregisterTaskDefinition
+              - ecs:RegisterTaskDefinition
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - iam:PassRole
+              - iam:GetRole
+            Resource:
+              - !Sub 'arn:aws:iam::${AWS::AccountId}:role/*'
+          - Effect: Allow
+            Action:
+              - ecs:CreateService
+              - ecs:DeleteService
+              - ecs:DescribeServices
+              - ecs:UpdateService
+            Resource:
+              - !Sub 'arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:service/*/*'
+
+  CIUserCredentials:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName: !Ref CIUser
+
+  CIUserAccessKeyId:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: !Sub "/users/ci/access-key-id"
+      Type: String
+      Value: !Ref CIUserCredentials
+
+  # Of course, with CFn you can't create a SecureString...
+  CIUserSecretAccessKey:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: !Sub "/users/ci/secret-access-key"
+      Type: String
+      Value: !GetAtt ["CIUserCredentials", "SecretAccessKey"]
+
+Outputs:
+  SecurityGroup:
+    Value: !Ref 'ServiceSecurityGroup'
+    Description: The security group for the service itself
+    Export:
+      Name: !Sub "${ServiceName}-sg"
+
+  VPC:
+    Value: !Ref 'VPC'
+    Description: The ID of the VPC where the service runs
+    Export:
+      Name: !Sub "${ServiceName}-vpc"
+
+  Subnet0:
+    Value: !Ref 'Subnet0'
+    Export:
+      Name: !Sub "${ServiceName}-subnet-0"
+
+  Subnet1:
+    Value: !Ref 'Subnet1'
+    Export:
+      Name: !Sub "${ServiceName}-subnet-1"
+
+  Subnet2:
+    Value: !Ref 'Subnet2'
+    Export:
+      Name: !Sub "${ServiceName}-subnet-2"
+
+  ALBDNSName:
+    Value: !GetAtt ["ALB", "DNSName"]
+    Export:
+      Name: !Sub "${ServiceName}-alb-dnsname"
+
+  ALBHTTPSListener:
+    Value: !Ref ALBHTTPSListener
+    Export:
+      Name: !Sub "${ServiceName}-alb-https-listener"
+
+  CIUser:
+    Value: !Ref CIUser
+    Description: The name of the user that will be assigned to our CI
+    Export:
+      Name: "ci-user"
+
+  CIUserArn:
+    Value: !GetAtt ["CIUser", "Arn"]
+    Description: The ARN of the user that will be assigned to our CI
+    Export:
+      Name: "ci-user-arn"
+
+  HostedZoneID:
+    Value: "REDACTED"
+    Description: Put here the ID of your Route53 hosted zone
+    Export:
+      Name: "hosted-zone-id"
+

@@ -1,0 +1,166 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Sets up an environment for ta0
+Parameters:
+  Env:
+    Type: String
+    Description: The DNS-compliant name of the new environment for ta0
+    AllowedPattern: (?!-)[a-zA-Z0-9-.]{1,63}(?<!-)
+    ConstraintDescription: must be a valid DNS zone name.
+  Tag:
+    Type: String
+    Description: The git tag to deploy
+  Priority:
+    Type: String
+    Description: priority assigned to the ALB rule of this service
+    Default: 10
+  DefaultALBCanonicalHostedZoneID:
+    Description: >
+      The Route53 Hosted Zone for the ALIAS records.
+      This one defaults to the one in eu-west-1.
+      I'm too lazy to set up a proper mapping.
+    Type: String
+    Default: Z32O12XQLNTSW2
+
+Resources:
+            # --- This changes on every Tag variable change --- #
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${Env}-ta0-service-0'
+      # This is as tiny as it gets
+      Memory: 512
+      Cpu: 256
+      NetworkMode: awsvpc
+      ExecutionRoleArn: !Ref 'ExecutionRole'
+      RequiresCompatibilities:
+        - FARGATE
+      ContainerDefinitions:
+        - Name: !Sub '${Env}-ta0'
+          Essential: true
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/ta0:${Tag}"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Sub '/${Env}/ta0'
+              awslogs-region: !Sub "${AWS::Region}"
+              awslogs-stream-prefix: 'ta0'
+          PortMappings:
+            - HostPort: 80
+              ContainerPort: 80
+              Protocol: tcp
+
+            # --- Core stuff --- #
+
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: '/'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - "ecs-tasks.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+        # I'd restrict this one a bit more, to make it write only
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser
+
+  FargateService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: "ta0"
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+      DesiredCount: 1
+      HealthCheckGracePeriodSeconds: 30
+      LaunchType: FARGATE
+      # last time I checked, if omitted, it defaults to 1.3.0
+      # and therefore some feature would be gone missing.
+      PlatformVersion: 1.4.0
+      ServiceName: !Sub 'ta0-${Env}-0'
+      TaskDefinition: !Ref 'TaskDefinition'
+      LoadBalancers:
+        - ContainerName: !Sub 'ta0-${Env}'
+          ContainerPort: 80
+          TargetGroupArn: !Ref TargetGroup
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !ImportValue 'ta0-sg'
+          Subnets:
+            - !ImportValue "ta0-subnet-0"
+            - !ImportValue "ta0-subnet-1"
+            - !ImportValue "ta0-subnet-2"
+
+  DNSRecords:
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      HostedZoneName: 'example.org.'
+      RecordSets:
+        - Name: !Sub "ta0.${Env}.example.org"
+          AliasTarget:
+            DNSName: !ImportValue "ta0-alb-dnsname"
+            HostedZoneId: !Ref DefaultALBCanonicalHostedZoneID
+          Type: A
+        - Name: !Sub "ta0.${Env}.example.org"
+          ResourceRecords:
+            - "0 issue \"amazon.com\""
+          TTL: 300
+          Type: CAA
+
+  CWLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ta0/${Env}"
+      RetentionInDays: 180
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 80
+      Protocol: HTTP
+      HealthCheckPath: "/"
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: 20  # otherwise it's gonna take looooooong: default is 300
+      TargetType: ip
+      VpcId: !ImportValue 'VPC'
+
+  # ALB Listener setup
+  ListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+        - TargetGroupArn: !Ref TargetGroup
+          Type: forward
+      Conditions:
+        - Field: host-header
+          HostHeaderConfig:
+            Values:
+              - !Sub "ta0.${Env}.example.org"
+      ListenerArn: !ImportValue "ta0-alb-https-listener"
+      Priority: !Ref Priority
+
+  SSLCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Sub 'ta0.${Env}.example.org'
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Sub 'ta0.${Env}.example.org'
+          HostedZoneId: !ImportValue "hosted-zone-id"
+
+  ListenerCertificate:
+    Type: AWS::ElasticLoadBalancingV2::ListenerCertificate
+    Properties:
+      ListenerArn: !ImportValue "ta0-alb-https-listener"
+      Certificates:
+        - CertificateArn: !Ref SSLCertificate
+
