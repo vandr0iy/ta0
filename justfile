@@ -8,7 +8,7 @@ serve-raw:
   hugo serve -D
 
 # build a docker image with your hugo website
-build tag=ta0-local:
+build tag="ta0-local":
   docker build . -t {{tag}}
 
 # serves the docker image on port 1313
@@ -27,6 +27,10 @@ deploy env tag:
     --capabilities CAPABILITY_NAMED_IAM \
     --parameter-overrides Env="{{env}}" Tag="{{tag}}"
 
-validate-cfn-template filename=ta0:
+#cloudformation template validation with AWS own API
+validate-cfn-template filename="ta0":
   @aws cloudformation validate-template --template-body file://{{filename}}.yml
 
+# launches a config scan with trivy
+trivy-scan:
+  @trivy config .

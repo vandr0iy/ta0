@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.2
-FROM klakegg/hugo as build
+FROM klakegg/hugo:latest as build
 
 COPY ./ /ta0
 WORKDIR /ta0
@@ -9,5 +9,6 @@ RUN hugo
 FROM nginx:alpine
 COPY --from=build /ta0/public /usr/share/nginx/html
 
+USER nginx
 WORKDIR /usr/share/nginx/html
 

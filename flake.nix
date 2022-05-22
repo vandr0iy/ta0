@@ -13,9 +13,11 @@
       in {
         devShell = pkgs.mkShell {
           buildInputs = with pkgs; [
+            dive
             docker
             hugo
             just
+            trivy
           ];
         };
       }
